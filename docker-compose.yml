@@ -1,0 +1,169 @@
+version: '3.8'
+
+services:
+  # =========================================================================
+  # 1. Primary Relational Storage (PostgreSQL)
+  # =========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: constructguard-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-constructguard}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-constructguard}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - constructguard-net
+
+  # =========================================================================
+  # 2. In-Memory Cache & Message Broker for BullMQ (Redis)
+  # =========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: constructguard-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - constructguard-net
+
+  # =========================================================================
+  # 3. IoT Telemetry Message Broker (Mosquitto MQTT)
+  # =========================================================================
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: constructguard-mqtt
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./scripts/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/1883' || exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - constructguard-net
+
+  # =========================================================================
+  # 4. Computer Vision Microservice (Python / FastAPI / OpenCV / YOLO)
+  # =========================================================================
+  cv-service:
+    build:
+      context: ./cv-service
+      dockerfile: Dockerfile
+    container_name: constructguard-cv
+    restart: unless-stopped
+    environment:
+      - PORT=8000
+      - CONFIDENCE_THRESHOLD=${CV_CONFIDENCE_THRESHOLD:-0.50}
+      - CHANGE_THRESHOLD=${CV_CHANGE_THRESHOLD:-25.0}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - constructguard-net
+
+  # =========================================================================
+  # 5. Core Backend API & Worker Orchestration (Node.js / Express / TypeScript)
+  # =========================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: constructguard-backend
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=${PORT:-5000}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_NAME=${DB_NAME:-constructguard}
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/${DB_NAME:-constructguard}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MQTT_BROKER_URL=mqtt://mosquitto:1883
+      - CV_SERVICE_URL=http://cv-service:8000
+      - JWT_SECRET=${JWT_SECRET:-constructguard_super_secret_jwt_key_change_in_production}
+    ports:
+      - "${PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      cv-service:
+        condition: service_healthy
+    networks:
+      - constructguard-net
+
+  # =========================================================================
+  # 6. IoT Telemetry Sensor Simulator (Python)
+  # =========================================================================
+  iot-simulator:
+    build:
+      context: ./iot-simulator
+      dockerfile: Dockerfile
+    container_name: constructguard-iot
+    restart: unless-stopped
+    environment:
+      - MQTT_BROKER=mosquitto
+      - MQTT_PORT=1883
+      - PUBLISH_INTERVAL_SECONDS=5
+    depends_on:
+      - mosquitto
+    networks:
+      - constructguard-net
+
+  # =========================================================================
+  # 7. Operator Monitoring Dashboard (React / Vite / Tailwind)
+  # =========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: constructguard-frontend
+    restart: unless-stopped
+    environment:
+      - VITE_API_URL=http://localhost:4000/api/v1
+      - VITE_WS_URL=http://localhost:4000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - constructguard-net
+
+networks:
+  constructguard-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  mosquitto_data:
